@@ -26,7 +26,7 @@ var (
 	retries        = flag.Int("r", 0, "Number of SNMP retries")
 	concurrency    = flag.Int("C", 1000, "Max concurrent scan tasks")
 	shortMode      = flag.Bool("s", false, "Short mode, print only IP addresses that respond")
-	quietMode      = flag.Bool("q", false, "Quiet mode, suppress informational messages on console")
+	quietMode      = flag.Bool("q", false, "Quiet mode, suppress informational messages (results shown unless -o used)")
 	debugMode      = flag.Bool("d", false, "Enable debug logging (prints errors/timeouts)")
 
 	// Global variables
@@ -48,45 +48,47 @@ type scanTarget struct {
 func configureLogger() {
 	log.SetFlags(log.Ltime) // Only show time
 	if *quietMode {
-		log.SetOutput(io.Discard) // Discard informational logs if quiet
+		// Only suppress informational logs if quiet
+		log.SetOutput(io.Discard)
 	} else {
 		log.SetOutput(os.Stderr) // Print informational logs to stderr by default
 	}
-	// Note: Errors printed directly (like file not found) might still appear on stderr
 }
 
 func setupOutputFile(filename string) {
 	var err error
 	outputFH, err = os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		// Use fmt.Fprintf for critical errors before logger might be fully set up
 		fmt.Fprintf(os.Stderr, "[!] Error opening output file %s: %v\n", filename, err)
 		outputFH = nil
 	} else {
-		log.Printf("[i] Logging results to: %s\n", filename) // Log info goes to stderr if not quiet
+		// Use log.Printf which respects quiet mode setting from configureLogger
+		log.Printf("[i] Logging results to: %s\n", filename)
 	}
 }
 
+// --- UPDATED logResult Function ---
 func logResult(message string) {
-	// Print result to stdout only if NOT quiet
-	if !*quietMode {
+	// Print result to stdout UNLESS quiet mode AND an output file are BOTH specified
+	if !(*quietMode && *outputFile != "") {
 		fmt.Println(message)
 	}
 	// Always write to file if open
 	if outputFH != nil {
 		if _, err := fmt.Fprintln(outputFH, message); err != nil {
-			log.Printf("[!] Error writing to output file: %v\n", err) // Log actual error
+			// Use log.Printf which respects quiet mode for console output
+			log.Printf("[!] Error writing to output file: %v\n", err)
 		}
 	}
 }
+// --- END UPDATED logResult Function ---
+
 
 func loadCommunities(filename string) []string {
-	// (Function unchanged)
 	file, err := os.Open(filename)
 	if err != nil { log.Printf("[!] Error opening community file %s: %v. Using defaults.\n", filename, err); return communities }
 	defer file.Close()
-	loadedCommunities := []string{}
-	scanner := bufio.NewScanner(file)
+	loadedCommunities := []string{}; scanner := bufio.NewScanner(file)
 	for scanner.Scan() { line := strings.TrimSpace(scanner.Text()); if line != "" && !strings.HasPrefix(line, "#") { loadedCommunities = append(loadedCommunities, line) } }
 	if err := scanner.Err(); err != nil { log.Printf("[!] Error reading community file %s: %v. Using defaults.\n", filename, err); return communities }
 	if len(loadedCommunities) > 0 { log.Printf("[i] Loaded %d communities from %s\n", len(loadedCommunities), filename); return loadedCommunities }
@@ -94,12 +96,10 @@ func loadCommunities(filename string) []string {
 }
 
 func incIP(ip net.IP) {
-	// (Function unchanged)
 	for j := len(ip) - 1; j >= 0; j-- { ip[j]++; if ip[j] > 0 { break } }
 }
 
 func expandTargets(targetSpecs []string, filename string) []string {
-	// (Function unchanged)
 	targetSet := make(map[string]struct{})
 	if filename != "" {
 		log.Printf("[i] Reading targets from file: %s\n", filename)
@@ -110,7 +110,7 @@ func expandTargets(targetSpecs []string, filename string) []string {
 		}
 	}
 	for _, spec := range targetSpecs {
-		_, ipNet, err := net.ParseCIDR(spec)
+		_, ipNet, err := net.ParseCIDR(spec) // Use blank identifier for unused ipAddr
 		if err == nil {
 			log.Printf("[i] Expanding CIDR: %s\n", spec); count := 0; limit := 10 * 65536
 			currentIP := ipNet.IP.To4(); if currentIP == nil { log.Printf("[!] Warning: Skipping non-IPv4 CIDR %s\n", spec); continue }
@@ -136,7 +136,6 @@ func expandTargets(targetSpecs []string, filename string) []string {
 
 
 func worker(id int) {
-	// (Worker function unchanged - sends results to channel)
 	defer wg.Done()
 	for target := range targetChan {
 		if *debugMode { log.Printf("[d] Worker %d processing %s [%s]\n", id, target.IP, target.Community) }
@@ -156,66 +155,88 @@ func worker(id int) {
 			variable := result.Variables[0]
 			if variable.Type != gosnmp.NoSuchObject && variable.Type != gosnmp.NoSuchInstance {
 				var valueStr string
-				switch variable.Type {
-				case gosnmp.OctetString:
-					cleanedBytes := []byte{}; for _, b := range variable.Value.([]byte) { if b >= 32 && b <= 126 { cleanedBytes = append(cleanedBytes, b) } else { cleanedBytes = append(cleanedBytes, '.') } }; valueStr = string(cleanedBytes)
-				default: valueStr = fmt.Sprintf("%v", variable.Value)
-				}
+				switch variable.Type { case gosnmp.OctetString: cleanedBytes := []byte{}; for _, b := range variable.Value.([]byte) { if b >= 32 && b <= 126 { cleanedBytes = append(cleanedBytes, b) } else { cleanedBytes = append(cleanedBytes, '.') } }; valueStr = string(cleanedBytes); default: valueStr = fmt.Sprintf("%v", variable.Value) }
 				resultLine := fmt.Sprintf("%s [%s] %s", target.IP, target.Community, valueStr)
-				resultsChan <- resultLine
-				if *shortMode { resultsChan <- target.IP }
+				resultsChan <- resultLine // Send full result line to processor
+				if *shortMode { resultsChan <- target.IP } // Send just IP if short mode
 			} else { if *debugMode { log.Printf("[d] SNMP Error for %s [%s]: %s\n", target.IP, target.Community, variable.Type.String()) } }
 		} else { if *debugMode { log.Printf("[d] No variables received for %s [%s]\n", target.IP, target.Community) } }
 	}
 }
 
+// --- UPDATED resultProcessor Function ---
 func resultProcessor() {
-	// (resultProcessor function unchanged - uses logResult which now checks quiet mode)
-	shortModeIPs := make(map[string]struct{})
+	shortModeIPs := make(map[string]struct{}) // Tracks IPs printed in short mode
 	for result := range resultsChan {
 		if *shortMode {
-			if strings.Contains(result, ".") { // Crude check for IP vs full line
+			// If it looks like just an IP address (simple check)
+			if ip := net.ParseIP(result); ip != nil {
 				if _, exists := shortModeIPs[result]; !exists {
-					// Print unique IP to stdout even if quiet, unless file output is specified?
-					// Original onesixtyone -s -q -o file outputs nothing to stdout.
-					// Let's match that: only print if not quiet.
-					if !*quietMode {
-					    fmt.Println(result)
+					// Print unique IP to stdout only if NOT quiet OR if no output file
+					if !(*quietMode && *outputFile != "") {
+						fmt.Println(result)
 					}
 					// Always log unique IP to file if open
 					if outputFH != nil { fmt.Fprintln(outputFH, result) }
 					shortModeIPs[result] = struct{}{}
 				}
 			}
+			// Ignore the full result line that might have been sent before the IP
 		} else {
-			logResult(result) // logResult handles quiet mode check for console output
+			// Normal mode, logResult handles quiet logic for console output
+			logResult(result)
 		}
 	}
 }
+// --- END UPDATED resultProcessor ---
+
 
 // --- Main Execution ---
 func main() {
 	flag.Parse() // Parse flags first
 	configureLogger() // Configure logging based on flags (like -q)
 
+	// --- MODIFIED Warning Check ---
+	// Warn if quiet mode is used without an output file, mentioning results still print
+	if *quietMode && *outputFile == "" {
+		// Use fmt.Fprintf to ensure this warning appears even if logger is discarded by -q
+		// Check if short mode is also off, as short mode still prints IPs unless -o used
+		if !*shortMode {
+		    fmt.Fprintln(os.Stderr, "[!] Warning: Quiet mode (-q) used without output file (-o). Results will only be printed to console.")
+		} else {
+			// If short mode IS on, then -q without -o is completely silent, matching onesixtyone
+			 // No warning needed in this specific case (-q -s without -o)
+		}
+	}
+    // --- END MODIFICATION ---
+
 	if *outputFile != "" { setupOutputFile(*outputFile); if outputFH != nil { defer outputFH.Close() } }
 
 	if *communityFile != "" { communities = loadCommunities(*communityFile)
 	} else if flag.NArg() > 1 { communities = []string{flag.Arg(1)}; log.Printf("[i] Using community from command line: %s\n", communities[0])
-	} else if len(communities) > 0 && *communityFile == "" { log.Printf("[i] No community file/argument. Using defaults: %v\n", communities) }
-	if len(communities) == 0 { log.Fatal("[!] No community strings specified or loaded. Exiting.") } // Use log.Fatal
+	} else if len(communities) > 0 && *communityFile == "" && flag.NArg() <= 1 { log.Printf("[i] No community file/argument. Using defaults: %v\n", communities) }
+	if len(communities) == 0 { log.Fatal("[!] No community strings specified or loaded. Exiting.") }
+
 
 	targetSpecs := []string{}
-	if flag.NArg() > 0 && *targetFile == "" { targetSpecs = []string{flag.Arg(0)} }
+	if flag.NArg() > 0 {
+	    if *targetFile == "" { targetSpecs = []string{flag.Arg(0)}
+	    } else if flag.NArg() > 0 { log.Printf("[i] Ignoring positional target '%s' because -i flag was used.\n", flag.Arg(0)) }
+	}
+
+	if len(targetSpecs) == 0 && *targetFile == "" { log.Fatal("[!] No targets specified via argument or -i file. Exiting.") }
+
 	targets = expandTargets(targetSpecs, *targetFile)
-	if len(targets) == 0 { log.Fatal("[!] No valid targets specified or loaded. Exiting.") } // Use log.Fatal
+	if len(targets) == 0 { log.Fatal("[!] No valid targets specified or loaded. Exiting.") }
 
 	log.Printf("[i] Starting scan: %d hosts, %d communities.\n", len(targets), len(communities))
 	log.Printf("[i] Concurrency=%d, Timeout=%.2fs, Retries=%d, Port=%d\n", *concurrency, *timeoutSeconds, *retries, *port)
 
 	targetChan = make(chan scanTarget, *concurrency); resultsChan = make(chan string, *concurrency)
 	wg.Add(*concurrency); for i := 1; i <= *concurrency; i++ { go worker(i) }
-	go resultProcessor()
+	processorDone := make(chan bool)
+	go func() { resultProcessor(); processorDone <- true }()
+
 
 	go func() {
 		for _, ip := range targets { for _, comm := range communities { targetChan <- scanTarget{IP: ip, Community: comm} } }
@@ -223,6 +244,6 @@ func main() {
 	}()
 
 	wg.Wait(); close(resultsChan)
-	time.Sleep(100 * time.Millisecond)
-	log.Printf("[i] Scan finished.") // This will only print to file or stderr if -q used
+	<-processorDone // Wait for result processor to finish handling results
+	log.Printf("[i] Scan finished.")
 }
