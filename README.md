@@ -30,3 +30,5 @@ real	1m47.749s
 user	0m0.064s
 sys	0m0.673s
 ```
+
+## Notes.  Main reason that I created another scanner is because onesixtyone is failing in CIDR parsing in some networks. 
